@@ -1,0 +1,496 @@
+data "aws_caller_identity" "current" {}
+
+data "aws_partition" "current" {}
+
+data "aws_region" "current" {}
+
+resource "random_uuid" "generate_uuid" {
+}
+
+# IAM Role for Lambda
+resource "aws_iam_role" "lambda_role" {
+  name = "${local.resources_prefix}-lambda_role-${substr(random_uuid.generate_uuid.result, 0, 6)}"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action = "sts:AssumeRole",
+        Effect = "Allow",
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      },
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow",
+        Principal = {
+          Service = "states.amazonaws.com"
+        },
+      }
+    ]
+  })
+  tags = local.common_tags
+}
+
+# IAM Policy for Lambda
+resource "aws_iam_policy" "lambda_policy" {
+  name        = "${local.resources_prefix}-lambda-policy-${substr(random_uuid.generate_uuid.result, 0, 6)}"
+  description = "Policy for managing EC2 and Target Groups"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Effect = "Allow",
+        Action = [
+          "ec2:StartInstances",
+          "ec2:StopInstances",
+          "elasticloadbalancing:RegisterTargets",
+          "elasticloadbalancing:DeregisterTargets",
+          "logs:CreateLogGroup",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents",
+          "lambda:InvokeFunction"
+        ],
+        Resource = [
+          "arn:aws:ec2:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:instance/*",
+          "arn:aws:elasticloadbalancing:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:targetgroup/*",
+          "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${aws_lambda_function.deregister_instance.function_name}:*",
+          "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${aws_lambda_function.stop_instance.function_name}:*",
+          "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${aws_lambda_function.start_instance.function_name}:*",
+          "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${aws_lambda_function.register_instance.function_name}:*",
+          "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:/aws/lambda/${aws_lambda_function.process_alarm.function_name}:*",
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.deregister_instance.function_name}",
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.stop_instance.function_name}",
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.start_instance.function_name}",
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.register_instance.function_name}"
+        ]
+      },
+      {
+        "Effect" : "Allow",
+        "Action" : [
+          "elasticloadbalancing:DescribeTargetHealth",
+          "ec2:DescribeInstanceStatus",
+          "ec2:DescribeInstances"
+        ],
+        "Resource" : "*"
+      },
+      {
+        Action = "sns:Publish"
+        Effect = "Allow"
+        Resource = "${var.sns_topic_arn}"
+      }
+    ]
+  })
+  tags = local.common_tags
+}
+
+# Attach policy to role
+resource "aws_iam_role_policy_attachment" "lambda_policy_attachment" {
+  role       = aws_iam_role.lambda_role.name
+  policy_arn = aws_iam_policy.lambda_policy.arn
+}
+
+resource "aws_iam_role_policy_attachment" "test_policy_attachment" {
+  role       = aws_iam_role.test_role.name
+  policy_arn = aws_iam_policy.test_policy.arn
+}
+
+
+resource "aws_iam_role" "test_role" {
+  name = "test"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action = "sts:AssumeRole",
+        Effect = "Allow",
+        Principal = {
+          Service = "lambda.amazonaws.com"
+        }
+      },
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow",
+        Principal = {
+          Service = "states.amazonaws.com"
+        },
+      }
+    ]
+  })
+  tags = local.common_tags
+}
+resource "aws_iam_policy" "test_policy" {
+  name        = "test"
+  description = "Policy for managing EC2 and Target Groups"
+  policy = jsonencode({
+    Version = "2012-10-17",
+    Statement = [
+      {
+        Action = "sns:Publish"
+        Effect = "Allow"
+        Resource = "${var.sns_topic_arn}"
+      }
+    ]
+  })
+  tags = local.common_tags
+}
+
+# Lambda Layer version for dependencies
+resource "aws_lambda_layer_version" "dependencies_layer" {
+  layer_name          = "onepam_smooth_restart-dependencies-layer"
+  description         = "Lambda layer for dependencies"
+  compatible_runtimes = ["python3.10"]
+  filename            = "${path.module}/build/dependencies.zip"
+  source_code_hash    = filebase64sha256("${path.module}/build/dependencies.zip")
+}
+
+# Lambda Functions to Deregister instance
+resource "aws_lambda_function" "deregister_instance" {
+  filename         = var.deregister_instance_zip
+  function_name    = "${local.resources_prefix}_DeregisterInstanceFunction"
+  runtime          = "python3.10"
+  role             = aws_iam_role.lambda_role.arn
+  handler          = "deregister_instance.lambda_handler"
+  source_code_hash = filebase64sha256("${path.module}/build/deregister_instance.zip")
+
+  layers = [
+    aws_lambda_layer_version.dependencies_layer.arn
+  ]
+
+  environment {
+    variables = {
+      TARGET_GROUP_ARN = var.target_group_arn
+      INSTANCE_IDS     = join(",", var.instance_ids)
+    }
+  }
+  tags = local.common_tags
+}
+
+# Lambda Function to Stop instance
+resource "aws_lambda_function" "stop_instance" {
+  filename      = var.stop_instance_zip
+  function_name = "${local.resources_prefix}_StopInstanceFunction"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "stop_instance.lambda_handler"
+
+  runtime          = "python3.10"
+  source_code_hash = filebase64sha256("${path.module}/build/stop_instance.zip")
+
+  environment {
+    variables = {
+      INSTANCE_IDS = join(",", var.instance_ids)
+    }
+  }
+  tags = local.common_tags
+}
+
+# Lambda Function to Start instances
+resource "aws_lambda_function" "start_instance" {
+  filename      = var.start_instance_zip
+  function_name = "${local.resources_prefix}_StartInstanceFunction"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "start_instance.lambda_handler"
+
+  runtime          = "python3.10"
+  source_code_hash = filebase64sha256("${path.module}/build/start_instance.zip")
+
+  layers = [
+    aws_lambda_layer_version.dependencies_layer.arn
+  ]
+
+  environment {
+    variables = {
+      INSTANCE_IDS = join(",", var.instance_ids)
+    }
+  }
+  tags = local.common_tags
+}
+
+# Lambda Function to Register instances
+resource "aws_lambda_function" "register_instance" {
+  filename      = var.register_instance_zip
+  function_name = "${local.resources_prefix}_RegisterInstanceFunction"
+  role          = aws_iam_role.lambda_role.arn
+  handler       = "register_instance.lambda_handler"
+
+  runtime          = "python3.10"
+  source_code_hash = filebase64sha256("${path.module}/build/register_instance.zip")
+
+  layers = [
+    aws_lambda_layer_version.dependencies_layer.arn
+  ]
+
+  environment {
+    variables = {
+      TARGET_GROUP_ARN = var.target_group_arn
+      INSTANCE_IDS     = join(",", var.instance_ids)
+    }
+  }
+  tags = local.common_tags
+}
+
+# Lambda Function to Process cloudwatch alarm
+resource "aws_lambda_function" "process_alarm" {
+  filename         = "${path.module}/build/cloudwatch_alarm.zip"
+  function_name    = "${local.resources_prefix}_ProcessAlarmFunction"
+  //role             = aws_iam_role.lambda_role.arn
+  role             = aws_iam_role.test_role.arn
+  handler          = "cloudwatch_alarm.lambda_handler"
+  runtime          = "python3.10"
+  source_code_hash = filebase64sha256("${path.module}/build/cloudwatch_alarm.zip")
+  
+  layers = [
+    aws_lambda_layer_version.dependencies_layer.arn
+  ]
+
+  environment {
+    variables = {
+      SNS_TOPICARN = var.sns_topic_arn
+    }
+  }
+  tags = local.common_tags
+}
+
+
+#StepFunctions for the whole workflow : Deregistring - Waiting - Stopping instance
+resource "aws_sfn_state_machine" "deregister_stop_state_machine" {
+  name     = "${local.resources_prefix}-DeregisterAndStopInstance"
+  role_arn = aws_iam_role.lambda_role.arn
+
+  definition = jsonencode({
+    Comment : "A simple state machine to deregister and stop an instance",
+    StartAt : "DeregisterInstance",
+    States : {
+      DeregisterInstance : {
+        Type : "Task",
+        Resource : aws_lambda_function.deregister_instance.arn,
+        Next : "WaitStateBeforeStopping"
+      },
+      WaitStateBeforeStopping : {
+        Type : "Wait",
+        Seconds : var.wait_time_before_stopping_seconds,
+        Next : "StopInstance"
+      },
+      StopInstance : {
+        Type : "Task",
+        Resource : aws_lambda_function.stop_instance.arn,
+        End : true
+      }
+    }
+  })
+  tags = local.common_tags
+}
+
+#StepFunctions for the whole workflow : Starting - Waiting - Deregistring instance
+resource "aws_sfn_state_machine" "start_register_state_machine" {
+  name     = "${local.resources_prefix}-StartAndRegisterInstance"
+  role_arn = aws_iam_role.lambda_role.arn
+
+  definition = jsonencode({
+    Comment : "A simple state machine to start and register an instance",
+    StartAt : "StartInstance",
+    States : {
+      StartInstance : {
+        Type : "Task",
+        Resource : aws_lambda_function.start_instance.arn,
+        Next : "WaitStateBeforeRegister"
+      },
+      WaitStateBeforeRegister : {
+        Type : "Wait",
+        Seconds : var.wait_time_before_register_seconds,
+        Next : "RegisterInstance"
+      },
+      RegisterInstance : {
+        Type : "Task",
+        Resource : aws_lambda_function.register_instance.arn,
+        End : true
+      }
+    }
+  })
+  tags = local.common_tags
+}
+
+# EventBridge Rules
+resource "aws_cloudwatch_event_rule" "deregister_stop_rule" {
+  name                = "${local.resources_prefix}_deregister_stop_rule"
+  description         = "Trigger Lambda to deregister instance before stopping"
+  schedule_expression = var.deregister_stop_schedule_expression
+  tags                = local.common_tags
+}
+
+resource "aws_cloudwatch_event_target" "deregister_stop_target" {
+  rule      = aws_cloudwatch_event_rule.deregister_stop_rule.name
+  target_id = "deregister_stop_sfn"
+  arn       = aws_sfn_state_machine.deregister_stop_state_machine.arn
+  role_arn  = aws_iam_role.lambda_role.arn
+}
+
+resource "aws_cloudwatch_event_rule" "start_register_rule" {
+  name                = "${local.resources_prefix}_start_register_rule"
+  description         = "Trigger Lambda to register instance after starting"
+  schedule_expression = var.start_register_schedule_expression
+  tags                = local.common_tags
+}
+
+resource "aws_cloudwatch_event_target" "start_register_target" {
+  rule      = aws_cloudwatch_event_rule.start_register_rule.name
+  target_id = "start_and_register_sfn"
+  arn       = aws_sfn_state_machine.start_register_state_machine.arn
+  role_arn  = aws_iam_role.lambda_role.arn
+}
+
+
+## Create CloudWatch Log Groups for each Lambda function
+resource "aws_cloudwatch_log_group" "deregister_lambda_log_group" {
+  name = "/aws/lambda/${aws_lambda_function.deregister_instance.function_name}"
+  retention_in_days = 30  # Adjust the retention period as needed
+}
+
+resource "aws_cloudwatch_log_group" "stop_lambda_log_group" {
+  name = "/aws/lambda/${aws_lambda_function.stop_instance.function_name}"
+  retention_in_days = 30  # Adjust the retention period as needed
+}
+
+resource "aws_cloudwatch_log_group" "start_lambda_log_group" {
+  name = "/aws/lambda/${aws_lambda_function.start_instance.function_name}"
+  retention_in_days = 30  # Adjust the retention period as needed
+}
+
+resource "aws_cloudwatch_log_group" "register_lambda_log_group" {
+  name = "/aws/lambda/${aws_lambda_function.register_instance.function_name}"
+  retention_in_days = 30  # Adjust the retention period as needed
+}
+
+resource "aws_cloudwatch_log_group" "process_alarm_log_group" {
+  name = "/aws/lambda/${aws_lambda_function.process_alarm.function_name}"
+  retention_in_days = 30  # Adjust the retention period as needed
+}
+
+# Subscribe an Email to the SNS Topic
+resource "aws_sns_topic_subscription" "smooth_restart_email_subscription" {
+  topic_arn = var.sns_topic_arn
+  protocol  = "email"
+  endpoint  = "hatem.cheikh.external@axa.com"
+}
+
+# Log Metric Filters and Alarms for Deregister Instance
+resource "aws_cloudwatch_log_metric_filter" "deregister_lambda_error_filter" {
+  name           = "DeregisterEC2LambdaErrorFilter"
+  log_group_name = aws_cloudwatch_log_group.deregister_lambda_log_group.name
+
+  metric_transformation {
+    name      = "DeregisterEC2LambdaErrors"
+    namespace = "/aws/lambda/"
+    value     = "1"
+    default_value = 0
+  }
+  pattern        = "?\"No instances\" ?\"error\""
+}
+
+resource "aws_cloudwatch_metric_alarm" "deregister_instance_error_alarm" {
+  alarm_name          = "DeregisterEC2LambdaErrors"
+  metric_name         = "DeregisterEC2LambdaErrors"
+  namespace           = "/aws/lambda/"
+  statistic           = "Sum"
+  period              = "60"  # 1 minute
+  evaluation_periods   = "1"
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  //alarm_actions       = [var.sns_topic_arn]
+  alarm_actions       = [aws_lambda_function.process_alarm.arn]
+
+  depends_on = [aws_cloudwatch_log_metric_filter.deregister_lambda_error_filter]
+}
+
+# Log Metric Filters and Alarms for Stop Instance
+resource "aws_cloudwatch_log_metric_filter" "stop_lambda_error_filter" {
+  name           = "StopEC2LambdaErrorFilter"
+  log_group_name = aws_cloudwatch_log_group.stop_lambda_log_group.name
+
+  metric_transformation {
+    name      = "StopEC2LambdaErrors"
+    namespace = "/aws/lambda/"
+    value     = "1"
+    default_value = 0
+  }
+  pattern        = "?\"No instances\" ?\"No valid\" ?\"error\""
+}
+
+resource "aws_cloudwatch_metric_alarm" "stop_instance_error_alarm" {
+  alarm_name          = "StopEC2LambdaErrors"
+  metric_name         = "StopEC2LambdaErrors"
+  namespace           = "/aws/lambda/"
+  statistic           = "Sum"
+  period              = "60"  # 1 minute
+  evaluation_periods   = "1"
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  alarm_actions       = [var.sns_topic_arn]
+
+  depends_on = [aws_cloudwatch_log_metric_filter.stop_lambda_error_filter]
+}
+
+# Log Metric Filters and Alarms for Start Instance
+resource "aws_cloudwatch_log_metric_filter" "start_lambda_error_filter" {
+  name           = "StartEC2LambdaErrorFilter"
+  log_group_name = aws_cloudwatch_log_group.start_lambda_log_group.name
+
+  metric_transformation {
+    name      = "StartEC2LambdaErrors"
+    namespace = "/aws/lambda/"
+    value     = "1"
+    default_value = 0
+  }
+  pattern        = "?\"No instances\" ?\"No valid\" ?\"error\""
+}
+
+resource "aws_cloudwatch_metric_alarm" "start_instance_error_alarm" {
+  alarm_name          = "StartEC2LambdaErrors"
+  metric_name         = "StartEC2LambdaErrors"
+  namespace           = "/aws/lambda/"
+  statistic           = "Sum"
+  period              = "60"  # 1 minute
+  evaluation_periods   = "1"
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  alarm_actions       = [var.sns_topic_arn]
+
+  depends_on = [aws_cloudwatch_log_metric_filter.start_lambda_error_filter]
+}
+
+# Log Metric Filters and Alarms for Register Instance
+resource "aws_cloudwatch_log_metric_filter" "register_lambda_error_filter" {
+  name           = "RegisterEC2LambdaErrorFilter"
+  log_group_name = aws_cloudwatch_log_group.register_lambda_log_group.name
+
+  metric_transformation {
+    name      = "RegisterEC2LambdaErrors"
+    namespace = "/aws/lambda/"
+    value     = "1"
+    default_value = 0
+  }
+  pattern        = "?\"No instances\" ?\"error\""
+}
+
+resource "aws_cloudwatch_metric_alarm" "register_instance_error_alarm" {
+  alarm_name          = "RegisterEC2LambdaErrors"
+  metric_name         = "RegisterEC2LambdaErrors"
+  namespace           = "/aws/lambda/"
+  statistic           = "Sum"
+  period              = "60"  # 1 minute
+  evaluation_periods   = "1"
+  threshold           = 1
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  alarm_actions       = [var.sns_topic_arn]
+
+  depends_on = [aws_cloudwatch_log_metric_filter.register_lambda_error_filter]
+}
+
+# Give Permission to Cloudwatch Alarm to invoke the process_alarm lambda function
+resource "aws_lambda_permission" "allow_cloudwatch_to_invoke" {
+  statement_id  = "AllowExecutionFromCloudWatch"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.process_alarm.function_name
+  principal     = "cloudwatch.amazonaws.com"
+  source_arn    = aws_cloudwatch_metric_alarm.deregister_instance_error_alarm.arn
+}
