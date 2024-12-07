@@ -1,133 +1,71 @@
-# Attach policy to role
-resource "aws_iam_role_policy_attachment" "lambda_policy_attachment" {
-  role       = aws_iam_role.lambda_role.name
-  policy_arn = aws_iam_policy.lambda_policy.arn
-}
+import boto3
+import os
+import logging
 
-resource "aws_iam_role_policy_attachment" "test_policy_attachment" {
-  role       = aws_iam_role.test_role.name
-  policy_arn = aws_iam_policy.test_policy.arn
-}
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
+# Initialize the Elastic Load Balancing v2 client
+elbv2 = boto3.client('elbv2')
 
-resource "aws_iam_role" "test_role" {
-  name = "test"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Action = "sts:AssumeRole",
-        Effect = "Allow",
-        Principal = {
-          Service = "lambda.amazonaws.com"
+# Environment variables
+TARGET_GROUP_ARN = os.getenv('TARGET_GROUP_ARN')
+INSTANCE_IDS = os.getenv('INSTANCE_IDS', '').split(',')
+
+def lambda_handler(event, context):
+    """
+    Deregisters instances from a specified target group in NLB.
+    """
+    try:
+        # Validate input
+        if not TARGET_GROUP_ARN or not INSTANCE_IDS:
+            raise ValueError("Environment variables TARGET_GROUP_ARN and INSTANCE_IDS are required.")
+
+        logger.info(f"Target Group ARN: {TARGET_GROUP_ARN}")
+        logger.info(f"Instance IDs: {INSTANCE_IDS}")
+
+        # Fetch target health descriptions
+        response = elbv2.describe_target_health(TargetGroupArn=TARGET_GROUP_ARN)
+        target_health_descriptions = response.get('TargetHealthDescriptions', [])
+
+        logger.info(f"Fetched target health descriptions for target group {TARGET_GROUP_ARN}.")
+
+        # Determine instances to deregister
+        instances_to_deregister = [
+            {'Id': instance_id}
+            for instance_id in INSTANCE_IDS
+            if any(
+                thd['Target']['Id'] == instance_id and thd['TargetHealth']['State'] not in ('draining', 'unused')
+                for thd in target_health_descriptions
+            )
+        ]
+
+        if instances_to_deregister:
+            # Deregister instances
+            deregister_response = elbv2.deregister_targets(
+                TargetGroupArn=TARGET_GROUP_ARN,
+                Targets=instances_to_deregister
+            )
+            logger.info(f"Successfully deregistered instances: {instances_to_deregister}")
+            logger.debug(f"Deregistration response: {deregister_response}")
+            return {
+                "status": "success",
+                "message": f"Instances deregistered: {instances_to_deregister}",
+                "deregistered_instances": [target['Id'] for target in instances_to_deregister]
+            }
+        else:
+            logger.warning(f"No instances to deregister for target group {TARGET_GROUP_ARN}.")
+            return {
+                "status": "warning",
+                "message": "No instances required deregistration.",
+                "deregistered_instances": []
+            }
+
+    except Exception as e:
+        logger.error(f"An error occurred: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"Failed to deregister instances: {str(e)}",
+            "deregistered_instances": []
         }
-      },
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow",
-        Principal = {
-          Service = "states.amazonaws.com"
-        },
-      }
-    ]
-  })
-  tags = local.common_tags
-}
-resource "aws_iam_policy" "test_policy" {
-  name        = "test"
-  description = "Policy for managing EC2 and Target Groups"
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Action = "sns:Publish"
-        Effect = "Allow"
-        Resource = "${var.sns_topic_arn}"
-      }
-    ]
-  })
-  tags = local.common_tags
-}
-
-# Lambda Functions to Deregister instance
-resource "aws_lambda_function" "deregister_instance" {
-  filename         = var.deregister_instance_zip
-  function_name    = "${local.resources_prefix}_DeregisterInstanceFunction"
-  runtime          = "python3.10"
-  role             = aws_iam_role.lambda_role.arn
-  handler          = "deregister_instance.lambda_handler"
-  source_code_hash = filebase64sha256("${path.module}/build/deregister_instance.zip")
-
-  layers = [
-    aws_lambda_layer_version.dependencies_layer.arn
-  ]
-
-  environment {
-    variables = {
-      TARGET_GROUP_ARN = var.target_group_arn
-      INSTANCE_IDS     = join(",", var.instance_ids)
-    }
-  }
-  tags = local.common_tags
-}
-
-
-# Lambda Function to Process cloudwatch alarm
-resource "aws_lambda_function" "process_alarm" {
-  filename         = "${path.module}/build/cloudwatch_alarm.zip"
-  function_name    = "${local.resources_prefix}_ProcessAlarmFunction"
-  //role             = aws_iam_role.lambda_role.arn
-  role             = aws_iam_role.test_role.arn
-  handler          = "cloudwatch_alarm.lambda_handler"
-  runtime          = "python3.10"
-  source_code_hash = filebase64sha256("${path.module}/build/cloudwatch_alarm.zip")
-  
-  layers = [
-    aws_lambda_layer_version.dependencies_layer.arn
-  ]
-
-  environment {
-    variables = {
-      SNS_TOPICARN = var.sns_topic_arn
-    }
-  }
-  tags = local.common_tags
-}
-
-# Log Metric Filters and Alarms for Deregister Instance
-resource "aws_cloudwatch_log_metric_filter" "deregister_lambda_error_filter" {
-  name           = "DeregisterEC2LambdaErrorFilter"
-  log_group_name = aws_cloudwatch_log_group.deregister_lambda_log_group.name
-
-  metric_transformation {
-    name      = "DeregisterEC2LambdaErrors"
-    namespace = "/aws/lambda/"
-    value     = "1"
-    default_value = 0
-  }
-  pattern        = "?\"No instances\" ?\"error\""
-}
-
-resource "aws_cloudwatch_metric_alarm" "deregister_instance_error_alarm" {
-  alarm_name          = "DeregisterEC2LambdaErrors"
-  metric_name         = "DeregisterEC2LambdaErrors"
-  namespace           = "/aws/lambda/"
-  statistic           = "Sum"
-  period              = "60"  # 1 minute
-  evaluation_periods   = "1"
-  threshold           = 1
-  comparison_operator = "GreaterThanOrEqualToThreshold"
-  //alarm_actions       = [var.sns_topic_arn]
-  alarm_actions       = [aws_lambda_function.process_alarm.arn]
-
-  depends_on = [aws_cloudwatch_log_metric_filter.deregister_lambda_error_filter]
-}
-
-# Give Permission to Cloudwatch Alarm to invoke the process_alarm lambda function
-resource "aws_lambda_permission" "allow_cloudwatch_to_invoke" {
-  statement_id  = "AllowExecutionFromCloudWatch"
-  action        = "lambda:InvokeFunction"
-  function_name = aws_lambda_function.process_alarm.function_name
-  principal     = "cloudwatch.amazonaws.com"
-  source_arn    = aws_cloudwatch_metric_alarm.deregister_instance_error_alarm.arn
-}
