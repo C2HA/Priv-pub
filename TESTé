@@ -69,3 +69,155 @@ def lambda_handler(event, context):
             "message": f"Failed to deregister instances: {str(e)}",
             "deregistered_instances": []
         }
+
+######################### process lambda###############
+
+import json
+import os
+import boto3
+import logging
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize the SNS client
+sns_client = boto3.client('sns')
+
+# Environment variables
+SNS_TOPICARN = os.getenv('SNS_TOPICARN', '')
+
+def lambda_handler(event, context):
+    """
+    Processes CloudWatch alarms and sends notifications to an SNS topic.
+    """
+    try:
+        if not SNS_TOPICARN:
+            raise ValueError("SNS_TOPICARN environment variable is not set.")
+
+        logger.info(f"Received event: {json.dumps(event)}")
+
+        # Extract details from the event
+        alarm_name = event.get('detail', {}).get('alarmName', 'Unknown Alarm')
+        state = event.get('detail', {}).get('state', {}).get('value', 'Unknown State')
+        reason = event.get('detail', {}).get('state', {}).get('reason', 'No reason provided')
+        reason_data = event.get('detail', {}).get('state', {}).get('reasonData', {})
+        log_message = reason_data.get('logMessage', 'No log message available')
+        
+        # Additional metadata if provided
+        deregister_results = event.get('deregisterResults', [])
+        
+        # Construct the notification message
+        message = (
+            f"CloudWatch Alarm Notification\n"
+            f"Alarm Name: {alarm_name}\n"
+            f"State: {state}\n"
+            f"Reason: {reason}\n"
+            f"Log Message: {log_message}\n"
+        )
+        
+        if deregister_results:
+            message += f"Deregister Results: {json.dumps(deregister_results, indent=2)}\n"
+        
+        logger.info(f"Publishing message to SNS topic: {SNS_TOPICARN}")
+        sns_client.publish(
+            TopicArn=SNS_TOPICARN,
+            Message=message,
+            Subject=f"CloudWatch Alarm: {alarm_name} State Change"
+        )
+
+        logger.info("Notification sent successfully!")
+
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                'message': 'Notification sent successfully!',
+                'alarmName': alarm_name,
+                'state': state
+            })
+        }
+
+    except ValueError as ve:
+        logger.error(f"ValueError: {str(ve)}")
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'error': str(ve)})
+        }
+
+    except Exception as e:
+        logger.error(f"Error processing CloudWatch alarm: {str(e)}", exc_info=True)
+        return {
+            'statusCode': 500,
+            'body': json.dumps({'error': 'Error processing CloudWatch alarm', 'details': str(e)})
+        }
+
+###########################
+
+
+resource "aws_sfn_state_machine" "start_register_state_machine" {
+  name     = "${local.resources_prefix}-StartAndRegisterInstance"
+  role_arn = aws_iam_role.lambda_role.arn
+
+  definition = jsonencode({
+    Comment: "State machine to start and register an instance with error handling",
+    StartAt: "StartInstance",
+    States: {
+      StartInstance: {
+        Type: "Task",
+        Resource: aws_lambda_function.start_instance.arn,
+        Next: "CheckStartStatus",
+        Catch: [
+          {
+            ErrorEquals: ["States.ALL"],
+            Next: "ProcessAlarm"
+          }
+        ]
+      },
+      CheckStartStatus: {
+        Type: "Choice",
+        Choices: [
+          {
+            Variable: "$.status",
+            StringEquals: "success",
+            Next: "WaitBeforeRegistering"
+          },
+          {
+            Variable: "$.status",
+            StringEquals: "error",
+            Next: "ProcessAlarm"
+          }
+        ],
+        Default: "FailState"
+      },
+      WaitBeforeRegistering: {
+        Type: "Wait",
+        Seconds: var.wait_time_before_register_seconds,
+        Next: "RegisterInstance"
+      },
+      RegisterInstance: {
+        Type: "Task",
+        Resource: aws_lambda_function.register_instance.arn,
+        End: true,
+        Catch: [
+          {
+            ErrorEquals: ["States.ALL"],
+            Next: "ProcessAlarm"
+          }
+        ]
+      },
+      ProcessAlarm: {
+        Type: "Task",
+        Resource: aws_lambda_function.process_alarm.arn,
+        End: true
+      },
+      FailState: {
+        Type: "Fail",
+        Error: "StartFailed",
+        Cause: "Unexpected error during start or registration"
+      }
+    }
+  })
+  tags = local.common_tags
+}
+
+
