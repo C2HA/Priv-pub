@@ -1,3 +1,104 @@
+import boto3
+import os
+import logging
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+elbv2 = boto3.client('elbv2')
+
+TARGET_GROUP_ARN = os.environ['TARGET_GROUP_ARN']
+INSTANCE_IDS = os.environ['INSTANCE_IDS'].split(',')
+
+def lambda_handler(event, context):
+    try:
+        targets = [{'Id': instance_id} for instance_id in INSTANCE_IDS]
+        response = elbv2.describe_target_health(TargetGroupArn=TARGET_GROUP_ARN)
+        target_health_descriptions = response['TargetHealthDescriptions']
+        
+        instances_to_deregister = [
+            target for target in targets 
+            if any(thd['Target']['Id'] == target['Id'] and thd['TargetHealth']['State'] != 'draining' 
+                   for thd in target_health_descriptions)
+        ]
+        
+        if instances_to_deregister:
+            elbv2.deregister_targets(
+                TargetGroupArn=TARGET_GROUP_ARN,
+                Targets=instances_to_deregister
+            )
+            logger.info(f"Deregistered instances {instances_to_deregister} from target group {TARGET_GROUP_ARN}")
+        else:
+            logger.info(f"No instances to deregister from target group {TARGET_GROUP_ARN}")
+        
+        return {'InstanceIds': INSTANCE_IDS}
+    except Exception as e:
+        logger.error(f"Error occurred while deregistering instances: {e}", exc_info=True)
+        raise
+
+
+############################# lambda processalarm#######################
+
+import json
+import os
+import boto3
+import logging
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+sns_client = boto3.client('sns')
+
+SNS_TOPICARN = os.environ['SNS_TOPICARN']
+
+def lambda_handler(event, context):
+    try:
+        logger.info(f"Received event: {json.dumps(event)}")
+        
+        # Check if 'detail' key exists in the event
+        if 'detail' not in event:
+            raise KeyError("'detail' key not found in the event")
+        
+        alarm_name = event['detail']['alarmName']
+        state = event['detail']['state']['value']
+        reason = event['detail']['state']['reason']
+        log_message = event['detail']['state']['reasonData']['logMessage']
+        
+        message = f"Alarm Name: {alarm_name}\nState: {state}\nReason: {reason}\nLog Message: {log_message}"
+        
+        logger.info(f"Publishing message to SNS: {message}")
+        
+        sns_client.publish(
+            TopicArn=SNS_TOPICARN,
+            Message=message,
+            Subject=f"CloudWatch Alarm: {alarm_name} State Change"
+        )
+        
+        logger.info("Notification sent successfully!")
+        
+        return {
+            'statusCode': 200,
+            'body': json.dumps('Notification sent successfully!')
+        }
+    except KeyError as e:
+        logger.error(f"KeyError: {str(e)}")
+        return {
+            'statusCode': 400,
+            'body': json.dumps(f"KeyError: {str(e)}")
+        }
+    except Exception as e:
+        logger.error(f"Error processing CloudWatch alarm: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps('Error processing CloudWatch alarm')
+        }
+
+
+############################################
+
+
 data "aws_caller_identity" "current" {}
 
 data "aws_partition" "current" {}
@@ -62,7 +163,8 @@ resource "aws_iam_policy" "lambda_policy" {
           "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.deregister_instance.function_name}",
           "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.stop_instance.function_name}",
           "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.start_instance.function_name}",
-          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.register_instance.function_name}"
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.register_instance.function_name}",
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${aws_lambda_function.process_alarm.function_name}"
         ]
       },
       {
@@ -88,51 +190,6 @@ resource "aws_iam_policy" "lambda_policy" {
 resource "aws_iam_role_policy_attachment" "lambda_policy_attachment" {
   role       = aws_iam_role.lambda_role.name
   policy_arn = aws_iam_policy.lambda_policy.arn
-}
-
-resource "aws_iam_role_policy_attachment" "test_policy_attachment" {
-  role       = aws_iam_role.test_role.name
-  policy_arn = aws_iam_policy.test_policy.arn
-}
-
-
-resource "aws_iam_role" "test_role" {
-  name = "test"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Action = "sts:AssumeRole",
-        Effect = "Allow",
-        Principal = {
-          Service = "lambda.amazonaws.com"
-        }
-      },
-      {
-        Action = "sts:AssumeRole"
-        Effect = "Allow",
-        Principal = {
-          Service = "states.amazonaws.com"
-        },
-      }
-    ]
-  })
-  tags = local.common_tags
-}
-resource "aws_iam_policy" "test_policy" {
-  name        = "test"
-  description = "Policy for managing EC2 and Target Groups"
-  policy = jsonencode({
-    Version = "2012-10-17",
-    Statement = [
-      {
-        Action = "sns:Publish"
-        Effect = "Allow"
-        Resource = "${var.sns_topic_arn}"
-      }
-    ]
-  })
-  tags = local.common_tags
 }
 
 # Lambda Layer version for dependencies
@@ -233,8 +290,7 @@ resource "aws_lambda_function" "register_instance" {
 resource "aws_lambda_function" "process_alarm" {
   filename         = "${path.module}/build/cloudwatch_alarm.zip"
   function_name    = "${local.resources_prefix}_ProcessAlarmFunction"
-  //role             = aws_iam_role.lambda_role.arn
-  role             = aws_iam_role.test_role.arn
+  role             = aws_iam_role.lambda_role.arn
   handler          = "cloudwatch_alarm.lambda_handler"
   runtime          = "python3.10"
   source_code_hash = filebase64sha256("${path.module}/build/cloudwatch_alarm.zip")
@@ -491,6 +547,6 @@ resource "aws_lambda_permission" "allow_cloudwatch_to_invoke" {
   statement_id  = "AllowExecutionFromCloudWatch"
   action        = "lambda:InvokeFunction"
   function_name = aws_lambda_function.process_alarm.function_name
-  principal     = "cloudwatch.amazonaws.com"
+  principal     = "lambda.alarms.cloudwatch.amazonaws.com"
   source_arn    = aws_cloudwatch_metric_alarm.deregister_instance_error_alarm.arn
 }
