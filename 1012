@@ -205,3 +205,96 @@ def lambda_handler(event, context):
             "status": "error",
             "message": f"Failed to process alarm: {str(e)}"
         }
+@@@@@@@@@@@@@@@@######################################
+
+
+processalarm 
+
+
+def lambda_handler(event, context):
+    """
+    Sends an SNS notification with error details when an alarm is triggered.
+    """
+    try:
+        logger.info("Received event for processing alarm:")
+        logger.info(event)
+
+        # Extract relevant details from the event
+        status = event.get('status', 'unknown')
+        error_message = event.get('error_message', 'No error message provided.')
+        step_name = event.get('step_name', 'unknown')
+
+        # Initialize variables for notification
+        notification_message = f"Status: {status}\nError Message: {error_message}"
+        subject_prefix = f"[{step_name.upper()}] " if step_name != "unknown" else ""
+
+        # Add specific details for each step_name
+        if step_name == "deregister":
+            target_group_arn = event.get('target_group_arn', 'N/A')
+            instance_ids = event.get('instance_ids', [])
+            notification_message += f"\nTarget Group ARN: {target_group_arn}\nInstances Affected: {', '.join(instance_ids) if instance_ids else 'None'}"
+            subject = f"{subject_prefix}Deregistration Notification"
+        elif step_name == "register":
+            registered_instances = event.get('registered_instances', [])
+            notification_message += f"\nRegistered Instances: {', '.join(registered_instances) if registered_instances else 'None'}"
+            subject = f"{subject_prefix}Registration Notification"
+        elif step_name in ["start", "stop"]:
+            instance_ids = event.get('instance_ids', [])
+            notification_message += f"\nInstances Affected: {', '.join(instance_ids) if instance_ids else 'None'}"
+            subject = f"{subject_prefix}{'Start' if step_name == 'start' else 'Stop'} Instance Notification"
+        else:
+            subject = f"{subject_prefix}Generic Notification"
+
+        logger.info(f"Notification message: {notification_message}")
+
+        # Publish to SNS
+        if not SNS_TOPIC_ARN:
+            raise ValueError("SNS_TOPIC_ARN environment variable is not set.")
+
+        sns_response = sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=notification_message
+        )
+
+        logger.info(f"Notification sent successfully. SNS Response: {sns_response}")
+
+        return {
+            "status": "success",
+            "message": "Alarm processed and notification sent successfully."
+        }
+
+    except Exception as e:
+        logger.error(f"An error occurred while processing the alarm: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"Failed to process alarm: {str(e)}"
+        }
+
+
+##############correctif deregister 
+
+def invoke_processalarm(status, message, target_group_arn, instance_ids, step_name):
+    """
+    Invokes the processalarm Lambda function with the specified payload.
+    """
+    try:
+        payload = {
+            "status": status,
+            "error_message": message,
+            "step_name": step_name,  # Add step_name to indicate which Lambda invoked processalarm
+        }
+
+        if step_name == "deregister":
+            payload["target_group_arn"] = target_group_arn
+            payload["instance_ids"] = instance_ids
+
+        logger.info(f"Invoking processalarm Lambda with payload: {json.dumps(payload)}")
+        response = lambda_client.invoke(
+            FunctionName=PROCESS_ALARM_FUNCTION_NAME,
+            InvocationType='Event',  # Asynchronous invocation
+            Payload=json.dumps(payload)
+        )
+        logger.info(f"ProcessAlarm Lambda invoked successfully. Response: {response}")
+    except Exception as e:
+        logger.error(f"Failed to invoke ProcessAlarm Lambda: {e}", exc_info=True)
