@@ -1,0 +1,207 @@
+deregister
+
+import boto3
+import os
+import logging
+import json
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize the Elastic Load Balancing v2 and Lambda clients
+elbv2 = boto3.client('elbv2')
+lambda_client = boto3.client('lambda')
+
+# Environment variables
+TARGET_GROUP_ARN = os.getenv('TARGET_GROUP_ARN')
+INSTANCE_IDS = os.getenv('INSTANCE_IDS', '').split(',')
+PROCESS_ALARM_FUNCTION_NAME = os.getenv('PROCESS_ALARM_FUNCTION_NAME')
+
+def invoke_processalarm(status, message, target_group_arn, instance_ids, step_name):
+    """
+    Invokes the processalarm Lambda function with the specified payload.
+    """
+    try:
+
+        payload = {
+            "status": status,
+            "error_message": message,
+            "target_group_arn": target_group_arn,
+            "instance_ids": instance_ids,
+            "step_name": step_name
+        }
+        logger.info(f"Invoking processalarm Lambda with payload: {json.dumps(payload)}")
+        response = lambda_client.invoke(
+            FunctionName=PROCESS_ALARM_FUNCTION_NAME,
+            InvocationType='Event',  # Asynchronous invocation
+            Payload=json.dumps(payload)
+        )
+        logger.info(f"ProcessAlarm Lambda invoked successfully. Response: {response}")
+    except Exception as e:
+        logger.error(f"Failed to invoke ProcessAlarm Lambda: {e}", exc_info=True)
+
+def lambda_handler(event, context):
+    """
+    Deregisters instances from a specified target group in NLB.
+    """
+    try:
+        # Validate input
+        if not TARGET_GROUP_ARN or not INSTANCE_IDS:
+            raise ValueError("Environment variables TARGET_GROUP_ARN and INSTANCE_IDS are required.")
+
+        logger.info(f"Target Group ARN: {TARGET_GROUP_ARN}")
+        logger.info(f"Instance IDs: {INSTANCE_IDS}")
+
+        # Fetch target health descriptions
+        response = elbv2.describe_target_health(TargetGroupArn=TARGET_GROUP_ARN)
+        target_health_descriptions = response.get('TargetHealthDescriptions', [])
+
+        logger.info(f"Fetched target health descriptions for target group {TARGET_GROUP_ARN}.")
+
+        # Determine instances to deregister
+        instances_to_deregister = [
+            {'Id': instance_id}
+            for instance_id in INSTANCE_IDS
+            if any(
+                thd['Target']['Id'] == instance_id and thd['TargetHealth']['State'] not in ('draining', 'unused')
+                for thd in target_health_descriptions
+            )
+        ]
+
+        if instances_to_deregister:
+            # Deregister instances
+            deregister_response = elbv2.deregister_targets(
+                TargetGroupArn=TARGET_GROUP_ARN,
+                Targets=instances_to_deregister
+            )
+            logger.info(f"Successfully deregistered instances: {instances_to_deregister}")
+            logger.debug(f"Deregistration response: {deregister_response}")
+            return {
+                "status": "success",
+                "message": f"Instances deregistered: {instances_to_deregister}",
+                "deregistered_instances": [target['Id'] for target in instances_to_deregister]
+            }
+        else:
+            warning_message = "No instances required deregistration."
+            logger.warning(warning_message)
+
+            # Invoke ProcessAlarm for warning status
+            invoke_processalarm(
+                status="warning",
+                message=warning_message,
+                target_group_arn=TARGET_GROUP_ARN,
+                instance_ids=[],
+                step_name="deregister"
+            )
+
+            return {
+                "status": "warning",
+                "message": warning_message,
+                "deregistered_instances": []
+            }
+
+    except Exception as e:
+        error_message = f"Failed to deregister instances: {str(e)}"
+        logger.error(error_message, exc_info=True)
+
+        # Invoke ProcessAlarm for error status
+        invoke_processalarm(
+            status="error",
+            message=error_message,
+            target_group_arn=TARGET_GROUP_ARN,
+            instance_ids=INSTANCE_IDS,
+            step_name="deregister"
+        )
+
+        return {
+            "status": "error",
+            "message": error_message,
+            "deregistered_instances": []
+        }
+
+
+        ########################lambda
+
+
+        import boto3
+import logging
+import os
+
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+# Initialize the SNS client
+sns = boto3.client('sns')
+
+# Environment variables
+SNS_TOPIC_ARN = os.getenv('SNS_TOPIC_ARN')  # The ARN of the SNS topic
+
+def lambda_handler(event, context):
+    """
+    Sends an SNS notification with error details when an alarm is triggered.
+    """
+    try:
+        logger.info("Received event for processing alarm:")
+        logger.info(event)
+
+        # Extract relevant details from the event
+        status = event.get('status', 'unknown')
+        error_message = event.get('error_message', 'No error message provided.')
+        instance_ids = event.get('instance_ids', [])
+        
+        # Initialize specific variables for deregistration /registration messages
+        deregistered_instances = event.get('deregistered_instances', [])
+        target_group_arn = event.get('target_group_arn', None)
+        registered_instances = event.get('registered_instances', [])
+
+        # Construct the notification message based on the event type
+        if deregistered_instances:  # Invoked by the deregister function
+            notification_message = (
+                f"Status: {status}\n"
+                f"Error Message: {error_message}\n"
+                f"Deregistered Instances: {', '.join(deregistered_instances) if deregistered_instances else 'None'}\n"
+                f"Target Group ARN: {target_group_arn if target_group_arn else 'N/A'}"
+            )
+            subject = "Deregistration Alarm Notification"
+        elif registered_instances:  # Invoked by the register function
+            notification_message = (
+                f"Status: {status}\n"
+                f"Error Message: {error_message}\n"
+                f"Registered Instances: {', '.join(registered_instances) if registered_instances else 'None'}"
+            )
+            subject = "Registration Alarm Notification"
+        else:  # Invoked by the start/stop functions
+            notification_message = (
+                f"Status: {status}\n"
+                f"Error Message: {error_message}\n"
+                f"Instances Affected: {', '.join(instance_ids) if instance_ids else 'None'}"
+            )
+            subject = "Instance State Change Notification"
+
+        logger.info(f"Notification message: {notification_message}")
+
+        # Publish to SNS
+        if not SNS_TOPIC_ARN:
+            raise ValueError("SNS_TOPIC_ARN environment variable is not set.")
+
+        sns_response = sns.publish(
+            TopicArn=SNS_TOPIC_ARN,
+            Subject=subject,
+            Message=notification_message
+        )
+
+        logger.info(f"Notification sent successfully. SNS Response: {sns_response}")
+
+        return {
+            "status": "success",
+            "message": "Alarm processed and notification sent successfully."
+        }
+
+    except Exception as e:
+        logger.error(f"An error occurred while processing the alarm: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": f"Failed to process alarm: {str(e)}"
+        }
